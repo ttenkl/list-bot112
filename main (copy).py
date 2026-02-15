@@ -1,6 +1,299 @@
 import telebot
 import datetime
 import time
+import sqlite3
+import json
+import os
+
+from flask import Flask
+from threading import Thread
+
+# ================= БАЗА =================
+
+conn = sqlite3.connect("bot.db", check_same_thread=False)
+cursor = conn.cursor()
+
+cursor.execute("""
+CREATE TABLE IF NOT EXISTS data (
+    key TEXT PRIMARY KEY,
+    value TEXT
+)
+""")
+
+conn.commit()
+
+
+def db_set(key, value):
+    cursor.execute(
+        "INSERT OR REPLACE INTO data (key, value) VALUES (?, ?)",
+        (key, json.dumps(value))
+    )
+    conn.commit()
+
+
+def db_get(key, default):
+    cursor.execute("SELECT value FROM data WHERE key=?", (key,))
+    row = cursor.fetchone()
+    if row:
+        return json.loads(row[0])
+    return default
+
+
+# ================= WEB SERVER (Render) =================
+
+app = Flask(__name__)
+
+
+@app.route('/')
+def home():
+    return "Bot is alive"
+
+
+def run():
+    app.run(host='0.0.0.0', port=int(os.environ.get("PORT", 10000)))
+
+
+def keep_alive():
+    t = Thread(target=run)
+    t.start()
+
+
+# ================= НАСТРОЙКИ =================
+
+TOKEN = "ТВОЙ_ТОКЕН_БОТА"
+OWNER_ID = 8402496361
+
+bot = telebot.TeleBot(TOKEN)
+
+admins = set(db_get("admins", [OWNER_ID]))
+
+active_list = "restart"
+
+lists = db_get("lists", {
+    "restart": {},
+    "payday": {}
+})
+
+owners = db_get("owners", {
+    "restart": {},
+    "payday": {}
+})
+
+usernames = db_get("usernames", {})
+
+msg_ids = db_get("msg_ids", {
+    "restart": None,
+    "payday": None
+})
+
+chat_ids = db_get("chat_ids", {
+    "restart": None,
+    "payday": None
+})
+
+# ================= СЕРВЕРА =================
+
+SERVERS = [
+("❤️","RED","ред"),("💚","GREEN","грин"),("💙","BLUE","блу"),
+("💛","YELLOW","еллоу"),("🧡","ORANGE","оранж"),("💜","PURPLE","пурпл"),
+("🍏","LIME","лайм"),("🌸","PINK","пинк"),("🍒","CHERRY","черри"),
+("🖤","BLACK","блэк"),("🔵","INDIGO","индиго"),("🤍","WHITE","вайт")
+]
+
+ALIASES = {}
+for emoji, eng, rus in SERVERS:
+    ALIASES[eng.lower()] = eng
+    ALIASES[rus.lower()] = eng
+
+
+def find_server(word):
+    return ALIASES.get(word.lower())
+
+
+# ================= ГЕНЕРАЦИЯ =================
+
+def generate(name):
+
+    date = datetime.datetime.now().strftime("%d.%m.%y")
+    title = "⚡ RESTART LIST ⚡" if name == "restart" else "💰 PAYDAY LIST 💰"
+
+    text = f"{title} [Дата: {date}]\n\n"
+
+    for emoji, eng, rus in SERVERS:
+        value = lists[name].get(eng, "")
+        text += f"{emoji} {eng} - {value}\n"
+
+    return text
+
+
+def update(name):
+
+    if msg_ids[name]:
+        try:
+            bot.edit_message_text(
+                generate(name),
+                chat_ids[name],
+                msg_ids[name]
+            )
+        except:
+            pass
+
+
+# ================= СОЗДАНИЕ =================
+
+def create_list(message, name):
+
+    global active_list
+
+    if message.from_user.id not in admins:
+        return
+
+    active_list = name
+
+    lists[name].clear()
+    owners[name].clear()
+
+    msg = bot.send_message(message.chat.id, generate(name))
+
+    msg_ids[name] = msg.message_id
+    chat_ids[name] = message.chat.id
+
+    bot.pin_chat_message(message.chat.id, msg.message_id)
+
+    db_set("lists", lists)
+    db_set("owners", owners)
+    db_set("msg_ids", msg_ids)
+    db_set("chat_ids", chat_ids)
+
+
+# ================= КОМАНДЫ =================
+
+@bot.message_handler(commands=['start', 'startlist'])
+def start_list(message):
+    create_list(message, "restart")
+
+
+@bot.message_handler(commands=['payday'])
+def payday_list(message):
+    create_list(message, "payday")
+
+
+# ================= ОСНОВНОЙ ОБРАБОТЧИК =================
+
+@bot.message_handler(func=lambda m: True)
+def handle(message):
+
+    if not active_list:
+        return
+
+    text = message.text.strip()
+
+    parts = text.split()
+
+    if len(parts) < 2:
+        return
+
+    srv = find_server(parts[0])
+
+    if not srv:
+        return
+
+    info = " ".join(parts[1:])
+    username = message.from_user.username or message.from_user.first_name
+
+    entry = f"{info} (@{username})"
+
+    lists[active_list][srv] = entry
+    owners[active_list][srv] = message.from_user.id
+
+    usernames[message.from_user.id] = username
+    db_set("usernames", usernames)
+
+    bot.reply_to(message, "✅ Записано")
+
+    db_set("lists", lists)
+    db_set("owners", owners)
+
+    update(active_list)
+
+
+# ================= ВОССТАНОВЛЕНИЕ =================
+
+def restore_messages():
+
+    for name in ["restart", "payday"]:
+
+        if not chat_ids.get(name):
+            continue
+
+        try:
+
+            if msg_ids.get(name):
+
+                bot.edit_message_text(
+                    generate(name),
+                    chat_ids[name],
+                    msg_ids[name]
+                )
+
+            else:
+                raise Exception("Нет сообщения")
+
+        except:
+
+            msg = bot.send_message(
+                chat_ids[name],
+                generate(name)
+            )
+
+            msg_ids[name] = msg.message_id
+
+            bot.pin_chat_message(
+                chat_ids[name],
+                msg.message_id
+            )
+
+            db_set("msg_ids", msg_ids)
+            db_set("chat_ids", chat_ids)
+
+
+# ================= ЗАПУСК =================
+
+print("Бот запущен")
+
+keep_alive()
+time.sleep(2)
+
+restore_messages()
+
+try:
+    bot.send_message(OWNER_ID, "✅ Бот запущен")
+except:
+    pass
+
+
+while True:
+    try:
+        bot.infinity_polling(
+            skip_pending=True,
+            timeout=60,
+            long_polling_timeout=60
+        )
+
+    except Exception as e:
+        print("Ошибка:", e)
+
+        try:
+            bot.send_message(
+                OWNER_ID,
+                f"❌ Бот упал!\nОшибка:\n{e}"
+            )
+        except:
+            pass
+
+        time.sleep(5)import telebot
+import datetime
+import time
 
 import sqlite3
 import json
